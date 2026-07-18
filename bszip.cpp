@@ -13,7 +13,6 @@
 #include <process.h>
 #pragma warning(disable:4996)
 using namespace std;
-
 #undef UNICODE
 #undef _UNICODE
 #define CP_GBK 936
@@ -25,25 +24,21 @@ using namespace std;
 #define IDC_BTN_SELECTFILES 105
 #define IDC_BTN_SELECTDIRS  106
 #define WM_USER_APPEND      (WM_USER + 100)
-
 #define IDC_FILE_LIST         201
 #define IDC_BTN_SELECTALL     202
 #define IDC_BTN_UNSELECTALL   203
 #define IDC_BTN_EXTRACT_SELECTED 204
-
 const string XOR_KEY = "BS";
 const int LZ_WINDOW_SIZE = 4096;
 const int LZ_MAX_LEN = 255;
 const int MATCH_THRESHOLD = 5;
 #define IDC_ARROW_A MAKEINTRESOURCEA(32512)
 #define IDI_APPLICATION_A MAKEINTRESOURCEA(32512)
-
 HWND hWndStatus;
 HWND hMainWnd;
 const char* CLASS_NAME = "BSZip";
 string g_CommandLineZipFile;
 bool g_bModalActive = false;
-
 // 存储文件的【压缩包内相对路径】+加密后数据，替换原来只存文件名
 struct ZipEntry
 {
@@ -53,7 +48,6 @@ struct ZipEntry
 vector<ZipEntry> g_previewEntries;
 vector<char> g_checkState;
 HWND g_previewWnd = nullptr;
-
 // 线程入参结构体
 struct CompressParam
 {
@@ -61,16 +55,16 @@ struct CompressParam
     string baseDir;
     vector<string> fullFilePaths;
 };
-
 wstring GBKToUnicode(const string& gbkStr);
 string UnicodeToGBK(const wstring& unicodeStr);
 void PostStatus(HWND hWnd, const string& text);
 void AppendStatus(const string& text);
 string XorCrypt(const string& data);
 string LZ77Compress(const string& input);
-string LZ77Decompress(const string& pack);
+bool LZ77DecompressStream(const string& packData, FILE* fpOut);
+bool UnpackDataToFile(const string& packedData, const string& outPath);
 string PackData(const string& fileRaw);
-string UnpackData(const string& packedData);
+string UnpackData(const string& pack);
 string ReadFileBin(const string& gbkPath);
 bool WriteFileBin(const string& gbkPath, const string& data);
 void RecurseScanFiles(const string& rootDir, vector<string>& outFiles);
@@ -87,7 +81,6 @@ bool ParseBszip(const string& zipPath, vector<ZipEntry>& entries);
 bool ExtractSelectedCore(HWND hParent, const string& outDir);
 void ShowZipPreview(HWND hParent);
 bool LaunchZipPreviewExe(const string& zipFilePath);
-
 bool LaunchZipPreviewExe(const string& zipFilePath)
 {
     char cmdLine[2048] = {0};
@@ -105,7 +98,6 @@ bool LaunchZipPreviewExe(const string& zipFilePath)
     PostStatus(hMainWnd, "启动bszip_bokzone.exe失败");
     return false;
 }
-
 // 向主线程发送日志消息，子线程专用
 void PostStatus(HWND hWnd, const string& text)
 {
@@ -113,7 +105,6 @@ void PostStatus(HWND hWnd, const string& text)
     strcpy(pBuf, text.c_str());
     PostMessageA(hWnd, WM_USER_APPEND, (WPARAM)pBuf, 0);
 }
-
 // 主线程真正执行文本追加
 void AppendStatus(const string& text)
 {
@@ -122,7 +113,6 @@ void AppendStatus(const string& text)
     SendMessageA(hWndStatus, EM_REPLACESEL, 0, (LPARAM)text.c_str());
     SendMessageA(hWndStatus, EM_REPLACESEL, 0, (LPARAM)"\r\n");
 }
-
 wstring GBKToUnicode(const string& gbkStr)
 {
     int len = MultiByteToWideChar(CP_GBK, 0, gbkStr.c_str(), -1, NULL, 0);
@@ -132,7 +122,6 @@ wstring GBKToUnicode(const string& gbkStr)
     delete[] wstr;
     return res;
 }
-
 string UnicodeToGBK(const wstring& unicodeStr)
 {
     int len = WideCharToMultiByte(CP_GBK, 0, unicodeStr.c_str(), -1, NULL, 0, NULL, NULL);
@@ -142,7 +131,6 @@ string UnicodeToGBK(const wstring& unicodeStr)
     delete[] str;
     return res;
 }
-
 string XorCrypt(const string& data)
 {
     string out = data;
@@ -152,7 +140,6 @@ string XorCrypt(const string& data)
     }
     return out;
 }
-
 string LZ77Compress(const string& input)
 {
     string out;
@@ -198,11 +185,70 @@ string LZ77Compress(const string& input)
     }
     return out;
 }
-
+// 流式LZ77解压，直接写入文件，解决大文件内存崩溃
+bool LZ77DecompressStream(const string& packData, FILE* fpOut)
+{
+    string outBuf;
+    const size_t BUF_FLUSH = 1024 * 1024;
+    outBuf.reserve(LZ_WINDOW_SIZE);
+    size_t pos = 0;
+    size_t n = packData.size();
+    while (pos < n)
+    {
+        unsigned char flagByte = static_cast<unsigned char>(packData[pos++]);
+        if (pos > n) break;
+        for (int i = 0; i < 8 && pos < n; i++)
+        {
+            if (flagByte & (1 << i))
+            {
+                if (pos + 3 > n) return false;
+                int off = static_cast<unsigned char>(packData[pos]) | (static_cast<unsigned char>(packData[pos + 1]) << 8);
+                int len = static_cast<unsigned char>(packData[pos + 2]);
+                pos += 3;
+                size_t start = outBuf.size() - off;
+                for (int k = 0; k < len; k++)
+                {
+                    outBuf += outBuf[start + k];
+                    if (outBuf.size() >= BUF_FLUSH)
+                    {
+                        fwrite(outBuf.data(), 1, outBuf.size(), fpOut);
+                        outBuf.clear();
+                    }
+                }
+            }
+            else
+            {
+                outBuf += packData[pos++];
+                if (outBuf.size() >= BUF_FLUSH)
+                {
+                    fwrite(outBuf.data(), 1, outBuf.size(), fpOut);
+                    outBuf.clear();
+                }
+            }
+        }
+    }
+    if (!outBuf.empty())
+    {
+        fwrite(outBuf.data(), 1, outBuf.size(), fpOut);
+    }
+    return true;
+}
+// 流式解密+解压直接输出文件，不产生超大内存字符串
+bool UnpackDataToFile(const string& packedData, const string& outPath)
+{
+    string lzData = XorCrypt(packedData);
+    wstring wOut = GBKToUnicode(outPath);
+    FILE* fp = _wfopen(wOut.c_str(), L"wb");
+    if (!fp) return false;
+    bool ret = LZ77DecompressStream(lzData, fp);
+    fclose(fp);
+    return ret;
+}
+// 旧接口保留兼容（小文件使用）
 string LZ77Decompress(const string& pack)
 {
     string out;
-    out.reserve(pack.size() * 3); // 预先分配内存，解决大文件解压崩溃
+    out.reserve(pack.size() * 3);
     size_t pos = 0;
     size_t n = pack.size();
     while (pos < n)
@@ -228,21 +274,18 @@ string LZ77Decompress(const string& pack)
     }
     return out;
 }
-
 string PackData(const string& fileRaw)
 {
     string packedLZ77 = LZ77Compress(fileRaw);
     string out = XorCrypt(packedLZ77);
     return out;
 }
-
 string UnpackData(const string& packedData)
 {
     string lzData = XorCrypt(packedData);
     string raw = LZ77Decompress(lzData);
     return raw;
 }
-
 string ReadFileBin(const string& gbkPath)
 {
     wstring wPath = GBKToUnicode(gbkPath);
@@ -260,7 +303,6 @@ string ReadFileBin(const string& gbkPath)
     fclose(fp);
     return data;
 }
-
 bool WriteFileBin(const string& gbkPath, const string& data)
 {
     wstring wPath = GBKToUnicode(gbkPath);
@@ -277,7 +319,6 @@ bool WriteFileBin(const string& gbkPath, const string& data)
     fclose(fp);
     return true;
 }
-
 // 递归遍历文件夹获取全部文件
 void RecurseScanFiles(const string& rootDir, vector<string>& outFiles)
 {
@@ -302,7 +343,6 @@ void RecurseScanFiles(const string& rootDir, vector<string>& outFiles)
     } while (FindNextFileA(hFind, &findData));
     FindClose(hFind);
 }
-
 // 获取文件相对于根目录的相对路径，统一分隔符为 '/'
 string GetRelativePath(const string& fullPath, const string& baseFolder)
 {
@@ -310,7 +350,6 @@ string GetRelativePath(const string& fullPath, const string& baseFolder)
     replace(rel.begin(), rel.end(), '\\', '/');
     return rel;
 }
-
 // 递归创建多级目录
 bool CreateFolderDeep(string gbkFolder)
 {
@@ -323,7 +362,6 @@ bool CreateFolderDeep(string gbkFolder)
     }
     return _mkdir(gbkFolder.c_str()) == 0;
 }
-
 // 选择文件，修复单选文件失效bug
 vector<string> SelectMultipleFiles(HWND hParent)
 {
@@ -341,7 +379,6 @@ vector<string> SelectMultipleFiles(HWND hParent)
     bool ok = GetOpenFileNameA(&ofn);
     g_bModalActive = false;
     if (!ok) return res;
-
     // 判断单选还是多选
     if (fileBuf[strlen(fileBuf) + 1] == '\0')
     {
@@ -360,7 +397,6 @@ vector<string> SelectMultipleFiles(HWND hParent)
     }
     return res;
 }
-
 vector<string> SelectMultiFolder(HWND hParent)
 {
     vector<string> dirList;
@@ -383,7 +419,6 @@ vector<string> SelectMultiFolder(HWND hParent)
     PostStatus(hMainWnd, "选中目录:" + string(buf));
     return dirList;
 }
-
 string SelectFolder(HWND hParent)
 {
     g_bModalActive = true;
@@ -399,7 +434,6 @@ string SelectFolder(HWND hParent)
     CoTaskMemFree(pidl);
     return string(buf);
 }
-
 string SelectSaveBszip(HWND hParent)
 {
     OPENFILENAMEA ofn = {0};
@@ -420,7 +454,6 @@ string SelectSaveBszip(HWND hParent)
         return string(buffer);
     return "";
 }
-
 string SelectOpenBszip(HWND hParent)
 {
     OPENFILENAMEA ofn = {0};
@@ -440,7 +473,6 @@ string SelectOpenBszip(HWND hParent)
         return string(buffer);
     return "";
 }
-
 // 压缩核心逻辑（子线程运行）
 bool DoCompressFileListCore(HWND hParent, const string& baseDir, const vector<string>& allFiles)
 {
@@ -466,7 +498,6 @@ bool DoCompressFileListCore(HWND hParent, const string& baseDir, const vector<st
     // 文件头：BSZIP:文件数::
     string head = "BSZIP:" + to_string(allFiles.size()) + "::";
     fwrite(head.data(), 1, head.size(), fpOut);
-
     for (size_t idx = 0; idx < allFiles.size(); idx++)
     {
         string filePath = allFiles[idx];
@@ -474,7 +505,6 @@ bool DoCompressFileListCore(HWND hParent, const string& baseDir, const vector<st
         PostStatus(hParent, "正在处理:" + relPath);
         string raw = ReadFileBin(filePath);
         string packedData = PackData(raw);
-
         int pathLen = (int)relPath.size();
         int dataLen = (int)packedData.size();
         // 写入：路径长度、路径字符串、加密数据长度、加密数据
@@ -488,14 +518,12 @@ bool DoCompressFileListCore(HWND hParent, const string& baseDir, const vector<st
     PostStatus(hParent, "压缩完成，输出文件：" + savePath);
     return true;
 }
-
 static inline int ReadInt(const char* p)
 {
     int res;
     memcpy(&res, p, sizeof(int));
     return res;
 }
-
 // 读取bszip压缩包
 bool ParseBszip(const string& zipPath, vector<ZipEntry>& entries)
 {
@@ -522,7 +550,6 @@ bool ParseBszip(const string& zipPath, vector<ZipEntry>& entries)
     int fileCnt = atoi(zipData.substr(pos, sep - pos).c_str());
     pos = sep + 2;
     PostStatus(hMainWnd, "压缩包内文件总数：" + to_string(fileCnt));
-
     for (int i = 0; i < fileCnt; i++)
     {
         if (pos + sizeof(int) * 2 > zipData.size()) break;
@@ -544,15 +571,14 @@ bool ParseBszip(const string& zipPath, vector<ZipEntry>& entries)
     }
     return true;
 }
-
-// 解压核心逻辑（子线程运行，自动创建子目录）
+// 解压核心逻辑（子线程运行，流式解压，解决大文件崩溃）
 bool ExtractSelectedCore(HWND hParent, const string& outDir)
 {
     CreateFolderDeep(outDir);
+    bool allOk = true;
     for (int i = 0; i < (int)g_previewEntries.size(); i++)
     {
         if (g_checkState[i] == 0) continue;
-        string raw = UnpackData(g_previewEntries[i].packedData);
         string innerPath = g_previewEntries[i].relativePath;
         replace(innerPath.begin(), innerPath.end(), '/', '\\');
         string fullFilePath = outDir + "\\" + innerPath;
@@ -560,15 +586,19 @@ bool ExtractSelectedCore(HWND hParent, const string& outDir)
         size_t lastSlash = fullFilePath.find_last_of("\\");
         string fileDir = fullFilePath.substr(0, lastSlash);
         CreateFolderDeep(fileDir);
-        if (WriteFileBin(fullFilePath, raw))
+        // 流式解压写入磁盘，不占用大块内存
+        bool ok = UnpackDataToFile(g_previewEntries[i].packedData, fullFilePath);
+        if (ok)
             PostStatus(hParent, "解压成功:" + g_previewEntries[i].relativePath);
         else
+        {
             PostStatus(hParent, "解压失败:" + g_previewEntries[i].relativePath);
+            allOk = false;
+        }
     }
     PostStatus(hParent, "选中文件解压完毕");
-    return true;
+    return allOk;
 }
-
 // 压缩线程入口
 unsigned int __stdcall CompressThreadProc(LPVOID pParam)
 {
@@ -577,7 +607,6 @@ unsigned int __stdcall CompressThreadProc(LPVOID pParam)
     delete p;
     return 0;
 }
-
 // 解压线程入口
 unsigned int __stdcall ExtractThreadProc(LPVOID pParam)
 {
@@ -586,7 +615,6 @@ unsigned int __stdcall ExtractThreadProc(LPVOID pParam)
     delete pOutDir;
     return 0;
 }
-
 // 预览窗口过程函数
 LRESULT CALLBACK PreviewWndProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
@@ -678,7 +706,6 @@ LRESULT CALLBACK PreviewWndProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lPar
     }
     return DefWindowProcA(hDlg, uMsg, wParam, lParam);
 }
-
 void ShowZipPreview(HWND hParent)
 {
     if (g_previewWnd != nullptr) return;
@@ -691,7 +718,6 @@ void ShowZipPreview(HWND hParent)
     g_previewWnd = CreateWindowExA(0, previewClass.lpszClassName, "预览压缩包", WS_POPUPWINDOW | WS_CAPTION | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, 450, 400, hParent, NULL, GetModuleHandleA(NULL), NULL);
 }
-
 LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg)
@@ -704,7 +730,6 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         HWND hTitle = CreateWindowExA(0, "STATIC", "BSZip", WS_VISIBLE | WS_CHILD | SS_CENTER, 10, 10, 500, 40, hWnd, (HMENU)IDC_STATIC_TITLE, GetModuleHandleA(NULL), NULL);
         HFONT hTitleFont = CreateFontA(24, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, GB2312_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "微软雅黑");
         SendMessageA(hTitle, WM_SETFONT, (WPARAM)hTitleFont, TRUE);
-
         HWND hBtnFile = CreateWindowExA(0, "BUTTON", "选择文件压缩", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 20, 70, 140, 60, hWnd, (HMENU)IDC_BTN_SELECTFILES, GetModuleHandleA(NULL), NULL);
         HWND hBtnDir = CreateWindowExA(0, "BUTTON", "选择文件夹压缩", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 170, 70, 140, 60, hWnd, (HMENU)IDC_BTN_SELECTDIRS, GetModuleHandleA(NULL), NULL);
         HWND hBtnDecomp = CreateWindowExA(0, "BUTTON", "解压缩包", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 320, 70, 140, 60, hWnd, (HMENU)IDC_BTN_DECOMPRESS, GetModuleHandleA(NULL), NULL);
@@ -712,11 +737,9 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         SendMessageA(hBtnFile, WM_SETFONT, (WPARAM)hBtnFont, TRUE);
         SendMessageA(hBtnDir, WM_SETFONT, (WPARAM)hBtnFont, TRUE);
         SendMessageA(hBtnDecomp, WM_SETFONT, (WPARAM)hBtnFont, TRUE);
-
         hWndStatus = CreateWindowExA(0, "EDIT", "", WS_VISIBLE | WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 10, 150, 500, 300, hWnd, (HMENU)IDC_EDIT_STATUS, GetModuleHandleA(NULL), NULL);
         HFONT hEditFont = CreateFontA(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, GB2312_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "微软雅黑");
         SendMessageA(hWndStatus, WM_SETFONT, (WPARAM)hEditFont, TRUE);
-
         if (!g_CommandLineZipFile.empty())
         {
             PostStatus(hWnd, "加载压缩包：" + g_CommandLineZipFile);
@@ -801,14 +824,12 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     }
     return 0;
 }
-
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(INITCOMMONCONTROLSEX);
     icc.dwICC = ICC_LISTVIEW_CLASSES;
     InitCommonControlsEx(&icc);
-
     if (lpCmdLine && strlen(lpCmdLine) > 0)
     {
         string arg(lpCmdLine);
@@ -826,7 +847,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             g_CommandLineZipFile = arg;
         }
     }
-
     WNDCLASSA wc = {0};
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
@@ -847,4 +867,3 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
     return 0;
 }
-
